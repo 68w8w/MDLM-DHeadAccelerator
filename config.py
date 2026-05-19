@@ -48,6 +48,16 @@ class Config:
     sample_every: int = 5000
     num_sample_texts: int = 4
 
+    # ── STM ──
+    use_stm: bool = True
+    num_intermediate_states: int = 4
+    tau_min: float = 0.1
+    tau_warmup_frac: float = 0.05
+    tau_decay_frac: float = 0.45
+    tau_total_steps: int = 3000       # quick test; 30000 for full run
+    partition_min_frac: float = 0.05
+    output_dir_stm: str = "./outputs_stm"
+
     # ── Paths ──
     hf_model_id: str = "kuleshov-group/mdlm-owt"
     train_data: str = "/data1/wulingdan/data/diffusion/mdlm/cache/openwebtext-train_train_bs1024_wrapped.dat"
