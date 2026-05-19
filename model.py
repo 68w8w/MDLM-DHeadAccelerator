@@ -291,6 +291,15 @@ class DHead(nn.Module):
             for _ in range(4)
         ])
 
+        # Residual D-Head: project DHead output to a delta in backbone space
+        self.delta_proj = nn.ModuleList([
+            nn.Linear(self.d, self.d, bias=False) for _ in range(4)
+        ])
+        for proj in self.delta_proj:
+            nn.init.zeros_(proj.weight)
+
+        self.delta_scale = nn.Parameter(torch.ones(4) * 0.1)
+
     def compute_one_head(self, hidden_src: torch.Tensor, z: torch.Tensor,
                          c: torch.Tensor, t_cur, band_idx: int) -> torch.Tensor:
         """
@@ -335,7 +344,12 @@ class DHead(nn.Module):
         z_stream = z_emb + pos_e + mask_ind + time_e + band_e
 
         # Per-band module
-        out = self.dhead_modules[band_idx](z_stream, hidden_src)  # [B, L, D]
+        h = self.dhead_modules[band_idx](z_stream, hidden_src)  # [B, L, D]
+
+        # Residual: project to delta, scale, add to backbone hidden
+        delta = self.delta_proj[band_idx](h)
+        scale = self.delta_scale[band_idx].to(delta.dtype)
+        out = hidden_src + scale * delta
 
         # Frozen output layer
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
@@ -357,6 +371,8 @@ class DHead(nn.Module):
             'band_embed.',
             'pos_embed.',
             'dhead_modules.',
+            'delta_proj.',
+            'delta_scale',
         )
         return {
             k: v for k, v in self.state_dict().items()
@@ -493,6 +509,8 @@ class DHeadStudent(nn.Module):
         params += list(self.heads.band_embed.parameters())
         params += list(self.heads.pos_embed.parameters())
         params += list(self.heads.dhead_modules.parameters())
+        params += list(self.heads.delta_proj.parameters())
+        params += [self.heads.delta_scale]
         return params
 
 
