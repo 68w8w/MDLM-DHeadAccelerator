@@ -81,8 +81,13 @@ def train_step(
     t_band_high = 1.0 - band_idx / config.n_bands
     t_band_low = 1.0 - (band_idx + 1) / config.n_bands
 
-    # t_src ~ Uniform(t_band_low, t_band_high)
-    t_src = torch.rand(B, device=device) * (t_band_high - t_band_low) + t_band_low
+    # t_src: mix of endpoint (t_band_high) and Uniform(t_band_low, t_band_high)
+    # Band 0 needs more t=1.0 full-mask starts; other bands use 30% endpoint.
+    endpoint_prob = 0.5 if band_idx == 0 else 0.3
+    use_endpoint = torch.rand(B, device=device) < endpoint_prob
+    t_uniform = torch.rand(B, device=device) * (t_band_high - t_band_low) + t_band_low
+    t_endpoint = torch.full((B,), t_band_high, device=device)
+    t_src = torch.where(use_endpoint, t_endpoint, t_uniform)
     t_dst = torch.full((B,), t_band_low, device=device)
 
     # 2. Forward noising
@@ -221,7 +226,7 @@ def train(config: Config = None, max_steps: int = None):
                 'step': step,
                 'student_state_dict': {
                     'backbone_loras': student.backbone_loras.state_dict(),
-                    'heads': student.heads.state_dict(),
+                    'heads': student.heads.trainable_state_dict(),
                 },
                 'optimizer': optimizer.state_dict(),
                 'config': config,

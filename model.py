@@ -345,6 +345,28 @@ class DHead(nn.Module):
 
         return logits
 
+    def trainable_state_dict(self):
+        """Return state_dict of trainable D-Head parameters only.
+
+        Excludes frozen _output_layer and _backbone_vocab_embed
+        which are reloaded from the HF model.
+        """
+        prefix_keep = (
+            'mask_indicator_embed.',
+            'time_embed.',
+            'band_embed.',
+            'pos_embed.',
+            'dhead_modules.',
+        )
+        return {
+            k: v for k, v in self.state_dict().items()
+            if k.startswith(prefix_keep)
+        }
+
+    def load_trainable_state_dict(self, state_dict, strict=False):
+        """Load only the trainable parameters."""
+        self.load_state_dict(state_dict, strict=False)
+
 
 # ======================================================================
 # DHeadStudent
@@ -420,10 +442,9 @@ class DHeadStudent(nn.Module):
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
             for i, blk in enumerate(dit.blocks):
                 B, S = x.shape[0], x.shape[1]
-                if self.training:
-                    bds = bias_dropout_add_scale_fused_train
-                else:
-                    bds = bias_dropout_add_scale_fused_inference
+                # Frozen backbone always uses inference path (no dropout),
+                # regardless of self.training which reflects D-Head's mode.
+                bds = bias_dropout_add_scale_fused_inference
 
                 (shift_msa, scale_msa, gate_msa,
                  shift_mlp, scale_mlp, gate_mlp) = (
