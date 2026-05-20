@@ -17,9 +17,85 @@ from torch.nn.utils import clip_grad_norm_
 from config import Config
 from data import get_dataloader
 from model import build_student, build_teacher
-from diffusion_utils import forward_noise, absorbing_reverse_step
+from diffusion_utils import forward_noise
 from train import KL_loss, get_cosine_schedule_with_warmup
-from inference import generate_samples
+from inference import generate_samples_official as generate_samples
+
+
+# ── Official MDLM transition primitives ───────────────────────────
+
+def _mdlm_sample_categorical(categorical_probs):
+    """Official MDLM Gumbel-trick sampling on probabilities."""
+    gumbel_norm = (
+        1e-10
+        - (torch.rand_like(categorical_probs) + 1e-10).log())
+    return (categorical_probs / gumbel_norm).argmax(dim=-1)
+
+
+def _loglinear_total_noise(t, eps=1e-3):
+    """LogLinear noise schedule: sigma(t) = -log(1 - (1-eps)*t)."""
+    if isinstance(t, (int, float)):
+        t = torch.tensor(t)
+    return -torch.log1p(-(1 - eps) * t)
+
+
+def _move_chance(t, eps=1e-3):
+    """Mask probability at time t under loglinear schedule."""
+    sigma = _loglinear_total_noise(t, eps)
+    return 1.0 - torch.exp(-sigma)
+
+
+def subs_log_probs(logits, xt, mask_id):
+    """Official _subs_parameterization: mask→-inf, normalize,
+    unmasked→one-hot."""
+    logits = logits.float()
+    logits[:, :, mask_id] = -1e9
+    logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+    unmasked = (xt != mask_id)
+    logits[unmasked] = -1e9
+    logits[unmasked, xt[unmasked]] = 0.0
+    return logits
+
+
+def official_reverse_step(z, log_p_x0, t_cur, t_next, mask_id, eps=1e-3):
+    """Official _ddpm_update transition kernel.
+
+    Args:
+        z: [B, L] current tokens
+        log_p_x0: [B, L, V] log probs (subs-parameterized)
+        t_cur: scalar, [B] — current time
+        t_next: scalar, [B] — next time
+        mask_id: MASK token id
+    Returns:
+        z_next: [B, L] updated tokens
+    """
+    B = z.shape[0]
+    device = z.device
+
+    # Ensure tensors
+    if not torch.is_tensor(t_cur):
+        t_cur = torch.tensor(t_cur, device=device)
+    if not torch.is_tensor(t_next):
+        t_next = torch.tensor(t_next, device=device)
+    if t_cur.dim() == 0:
+        t_cur = t_cur.expand(B)
+    if t_next.dim() == 0:
+        t_next = t_next.expand(B)
+
+    mc_t = _move_chance(t_cur, eps)  # [B]
+    mc_s = _move_chance(t_next, eps)  # [B]
+
+    p_x0 = log_p_x0.exp()  # [B, L, V]
+
+    # [B,1,1] for broadcasting with [B,L,V]
+    q_xs = p_x0 * (mc_t[:, None, None] - mc_s[:, None, None])
+    # [B,1] for broadcasting with [B,L]
+    q_xs[:, :, mask_id] = mc_s[:, None]
+
+    _x = _mdlm_sample_categorical(q_xs)
+
+    copy_flag = (z != mask_id).to(z.dtype)
+    return (copy_flag * z + (1 - copy_flag) * _x).long()
 
 
 # ── STM Utilities ───────────────────────────────────────────────────
@@ -122,14 +198,15 @@ def train_step_stm(student, teacher, x0, config, optimizer, scheduler,
     teacher_intervals = random_partition(
         teacher_total, N, config.partition_min_frac)   # [B, N]
 
-    # 5. STM loop
+    # 5. STM loop (official _ddpm_update transition)
     optimizer.zero_grad(set_to_none=True)
 
     raw_t = t_src.clone()
     total_loss_value = 0.0
+    substep_metrics = []  # per-substep logging
 
     for i in range(N):
-        # A. Student rollout to anchor (no_grad)
+        # A. Student rollout to anchor (no_grad, official transition)
         t_a = (raw_t - student_intervals[:, i]).clamp(min=0)
         t_a = torch.minimum(t_a, raw_t)
 
@@ -137,11 +214,10 @@ def train_step_stm(student, teacher, x0, config, optimizer, scheduler,
             logits_stu = student.heads.compute_one_head(
                 hidden_src=hidden_src, z=z, c=c_src,
                 t_cur=raw_t, band_idx=band_idx)
-            log_p_stu = F.log_softmax(logits_stu.float(), dim=-1)
-            z_anchor = absorbing_reverse_step(
-                z=z, log_p=log_p_stu,
-                t_curr=raw_t, t_next=t_a,
-                mask_token_id=MASK_ID)
+            log_p_stu = subs_log_probs(logits_stu, z, MASK_ID)
+            z_anchor = official_reverse_step(
+                z=z, log_p_x0=log_p_stu,
+                t_cur=raw_t, t_next=t_a, mask_id=MASK_ID)
             del logits_stu, log_p_stu
 
         # B. Teacher forward at anchor (no_grad)
@@ -161,17 +237,35 @@ def train_step_stm(student, teacher, x0, config, optimizer, scheduler,
 
         total_loss_value += loss_i.detach().item()
 
-        # E. Teacher rollout (no_grad)
+        # Per-substep metrics
+        with torch.no_grad():
+            mask_count = mask.sum().item()
+            sub_m = {
+                'sub': i,
+                'loss': loss_i.item(),
+                'mask_count': mask_count,
+                't_a': t_a.mean().item(),
+                'stu_interval': student_intervals[:, i].mean().item(),
+                'tea_interval': teacher_intervals[:, i].mean().item(),
+            }
+            substep_metrics.append(sub_m)
+
+        # E. Teacher rollout (no_grad, official transition)
         t_b = (t_a - teacher_intervals[:, i]).clamp(min=0)
         t_b = torch.minimum(t_b, t_a)
         with torch.no_grad():
-            z = absorbing_reverse_step(
-                z=z_anchor, log_p=log_pT,
-                t_curr=t_a, t_next=t_b,
-                mask_token_id=MASK_ID)
+            # Use teacher's log_pT with subs parameterization for rollout
+            log_pT_subs = log_pT.clone()
+            unmasked_anchor = (z_anchor != MASK_ID)
+            log_pT_subs[unmasked_anchor] = -1e9
+            log_pT_subs[unmasked_anchor, z_anchor[unmasked_anchor]] = 0.0
+
+            z = official_reverse_step(
+                z=z_anchor, log_p_x0=log_pT_subs,
+                t_cur=t_a, t_next=t_b, mask_id=MASK_ID)
 
         raw_t = t_b
-        del logits_S, log_pS, log_pT, loss_i
+        del logits_S, log_pS, log_pT, log_pT_subs, loss_i
 
     # Final time error: raw_t should equal t_dst
     final_t_error = (raw_t - t_dst).abs().max().item()
@@ -189,6 +283,7 @@ def train_step_stm(student, teacher, x0, config, optimizer, scheduler,
         'mean_student_interval': student_intervals.mean().item(),
         'mean_teacher_interval': teacher_intervals.mean().item(),
         'final_t_error': final_t_error,
+        'substep_metrics': substep_metrics,
     }
 
 
@@ -317,13 +412,13 @@ def on_policy_stm_diag(student, teacher, x0, config, tau):
                 t_a = (raw_t - stu_iv[:, i]).clamp(min=0)
                 t_a = torch.minimum(t_a, raw_t)
 
-                # Student rollout → z_anchor, free logits immediately
+                # Student rollout → z_anchor (official transition)
                 lgs = student.heads.compute_one_head(
                     hidden_src=hidden_src, z=z, c=c_src,
                     t_cur=raw_t, band_idx=band_idx)
-                lps = F.log_softmax(lgs.float(), dim=-1)
+                lps = subs_log_probs(lgs, z, MASK_ID)
                 del lgs
-                z_anchor = absorbing_reverse_step(
+                z_anchor = official_reverse_step(
                     z, lps, raw_t, t_a, MASK_ID)
                 del lps
 
@@ -359,12 +454,17 @@ def on_policy_stm_diag(student, teacher, x0, config, tau):
                     acc_T=aT, acc_S=aS,
                     agree=ag, t_a=t_a.mean().item()))
 
-                # Teacher rollout, then free lpT
+                # Teacher rollout (official transition)
                 t_b = (t_a - tea_iv[:, i]).clamp(min=0)
                 t_b = torch.minimum(t_b, t_a)
-                z = absorbing_reverse_step(
-                    z_anchor, lpT, t_a, t_b, MASK_ID)
-                del lpT
+                # Apply subs parameterization to teacher logits for rollout
+                lpT_subs = lpT.clone()
+                um = (z_anchor != MASK_ID)
+                lpT_subs[um] = -1e9
+                lpT_subs[um, z_anchor[um]] = 0.0
+                z = official_reverse_step(
+                    z_anchor, lpT_subs, t_a, t_b, MASK_ID)
+                del lpT, lpT_subs
                 raw_t = t_b
 
             del hidden_src, c_src
@@ -447,6 +547,8 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="./outputs_stm")
+    parser.add_argument("--resume_from", type=str, default=None,
+                        help="Path to checkpoint to resume/fine-tune from")
     args = parser.parse_args()
 
     config = Config()
@@ -500,11 +602,31 @@ def main():
     teacher = build_teacher(config, device)
     teacher.eval()
 
-    # ── Sanity check ──
-    ok = sanity_check_residual(student, config, device)
-    if not ok:
-        print("SANITY CHECK FAILED. Aborting.")
-        return
+    # ── Resume from checkpoint ──
+    start_step = 0
+    if args.resume_from:
+        print(f"Resuming from {args.resume_from}...")
+        ckpt = torch.load(args.resume_from, map_location=device,
+                          weights_only=False)
+        student.backbone_loras.load_state_dict(
+            ckpt['student_state_dict']['backbone_loras'])
+        student.heads.load_trainable_state_dict(
+            ckpt['student_state_dict']['heads'])
+        start_step = ckpt.get('step', 0)
+        print(f"  Loaded weights from step {start_step}")
+        print(f"  NOTE: optimizer/scheduler reset (fine-tune mode)")
+        del ckpt
+
+    # ── Sanity check (skip when resuming — delta_scale != 0.1) ──
+    if not args.resume_from:
+        ok = sanity_check_residual(student, config, device)
+        if not ok:
+            print("SANITY CHECK FAILED. Aborting.")
+            return
+    else:
+        ds = student.heads.delta_scale.data.tolist()
+        print(f"  Skipping sanity check (resume mode)")
+        print(f"  delta_scale: {ds}")
 
     # ── Parameter count ──
     trainable_params = student.get_trainable_parameters()
@@ -532,10 +654,11 @@ def main():
     t0 = time.time()
     step_t0 = time.time()
 
-    print(f"\nStarting STM training ({max_steps} steps)...\n")
+    print(f"\nStarting STM training ({max_steps} steps, "
+          f"start_step={start_step})...\n")
 
     abort = False
-    for step in range(1, max_steps + 1):
+    for step in range(start_step + 1, start_step + max_steps + 1):
         try:
             batch = next(train_iter)
         except StopIteration:
@@ -633,6 +756,32 @@ def main():
             print(f"  mean student interval: {avg_stu_i:.4f}")
             print(f"  mean teacher interval: {avg_tea_i:.4f}")
             print(f"  mean final_t_error: {avg_ft_err:.2e}")
+
+            # Per-substep loss breakdown (average over last DIAG_EVERY)
+            N = config.num_intermediate_states
+            recent_with_subs = [m for m in recent
+                                if 'substep_metrics' in m]
+            if recent_with_subs:
+                print(f"\n  Per-substep loss (avg over last "
+                      f"{len(recent_with_subs)} steps):")
+                print(f"  {'sub':>4} {'loss':>8} {'mask_cnt':>10} "
+                      f"{'t_a':>7} {'stu_iv':>8} {'tea_iv':>8}")
+                for si in range(N):
+                    subs = [m['substep_metrics'][si]
+                            for m in recent_with_subs
+                            if si < len(m['substep_metrics'])]
+                    if subs:
+                        avg_l = sum(s['loss'] for s in subs) / len(subs)
+                        avg_mc = sum(s['mask_count']
+                                     for s in subs) / len(subs)
+                        avg_ta = sum(s['t_a'] for s in subs) / len(subs)
+                        avg_si = sum(s['stu_interval']
+                                     for s in subs) / len(subs)
+                        avg_ti = sum(s['tea_interval']
+                                     for s in subs) / len(subs)
+                        print(f"  {si:>4} {avg_l:>8.4f} {avg_mc:>10.0f} "
+                              f"{avg_ta:>7.4f} {avg_si:>8.4f} "
+                              f"{avg_ti:>8.4f}")
 
             student.train()
 
