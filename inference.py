@@ -13,6 +13,7 @@ def generate_samples(
     config: Config,
     num_samples: int = 4,
     device: str = None,
+    substeps_per_band: int = None,
 ) -> torch.Tensor:
     """Full inference: 4 bands × K substeps.
 
@@ -21,6 +22,7 @@ def generate_samples(
         config: Config
         num_samples: number of sequences to generate
         device: device override
+        substeps_per_band: override config.K for inference
 
     Returns:
         z: [num_samples, L] generated token ids
@@ -29,7 +31,7 @@ def generate_samples(
         device = config.device
 
     L = config.max_length
-    K = config.K
+    K = substeps_per_band if substeps_per_band is not None else config.K
     MASK_ID = config.mask_token_id
     n_bands = config.n_bands
 

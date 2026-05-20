@@ -131,6 +131,7 @@ def train_step_stm(student, teacher, x0, config, optimizer, scheduler,
     for i in range(N):
         # A. Student rollout to anchor (no_grad)
         t_a = (raw_t - student_intervals[:, i]).clamp(min=0)
+        t_a = torch.minimum(t_a, raw_t)
 
         with torch.no_grad():
             logits_stu = student.heads.compute_one_head(
@@ -162,6 +163,7 @@ def train_step_stm(student, teacher, x0, config, optimizer, scheduler,
 
         # E. Teacher rollout (no_grad)
         t_b = (t_a - teacher_intervals[:, i]).clamp(min=0)
+        t_b = torch.minimum(t_b, t_a)
         with torch.no_grad():
             z = absorbing_reverse_step(
                 z=z_anchor, log_p=log_pT,
@@ -170,6 +172,9 @@ def train_step_stm(student, teacher, x0, config, optimizer, scheduler,
 
         raw_t = t_b
         del logits_S, log_pS, log_pT, loss_i
+
+    # Final time error: raw_t should equal t_dst
+    final_t_error = (raw_t - t_dst).abs().max().item()
 
     clip_grad_norm_(student.get_trainable_parameters(), config.grad_clip)
     optimizer.step()
@@ -183,6 +188,7 @@ def train_step_stm(student, teacher, x0, config, optimizer, scheduler,
         'teacher_total': teacher_total.mean().item(),
         'mean_student_interval': student_intervals.mean().item(),
         'mean_teacher_interval': teacher_intervals.mean().item(),
+        'final_t_error': final_t_error,
     }
 
 
@@ -252,6 +258,148 @@ def print_diag_table(diags, header=""):
               f"{d['acc_S']:>7.4f} {d['agree']:>7.4f}")
 
 
+# ── On-policy STM diagnostics ───────────────────────────────────────
+
+def _entropy_chunked(log_p, mask, chunk_size=512):
+    """Memory-efficient entropy: process masked positions in chunks."""
+    n = mask.sum().item()
+    if n == 0:
+        return 0.0
+    lp_m = log_p[mask].float()  # [M, V]
+    total = 0.0
+    for s in range(0, n, chunk_size):
+        lp_c = lp_m[s:s + chunk_size]
+        p_c = lp_c.exp()
+        e_c = -(p_c * lp_c)
+        e_c = torch.where(p_c > 0, e_c, torch.zeros_like(e_c))
+        total += e_c.sum(-1).sum().item()
+        del p_c, e_c
+    del lp_m
+    return total / n
+
+
+def on_policy_stm_diag(student, teacher, x0, config, tau):
+    """Run full STM loop (no_grad) per band, report per-substep metrics.
+
+    Memory-optimized: chunked entropy, aggressive del, empty_cache between bands.
+    """
+    MASK_ID = config.mask_token_id
+    N = config.num_intermediate_states
+    device = x0.device
+    was_training = student.training
+    student.eval()
+
+    torch.cuda.empty_cache()
+
+    results = []
+    for band_idx in range(4):
+        t_band_high = 1.0 - band_idx / 4
+        t_band_low = 1.0 - (band_idx + 1) / 4
+        B = x0.shape[0]
+        t_src = torch.full((B,), t_band_high, device=device)
+        t_dst = torch.full((B,), t_band_low, device=device)
+
+        z = forward_noise(x0, t_src, MASK_ID)
+
+        with torch.no_grad():
+            hidden_src, c_src = student.forward_backbone(z, t_src)
+
+            Delta = t_src - t_dst
+            stu_total = (1.0 - tau) * Delta
+            tea_total = tau * Delta
+            stu_iv = random_partition(stu_total, N, config.partition_min_frac)
+            tea_iv = random_partition(tea_total, N, config.partition_min_frac)
+
+            raw_t = t_src.clone()
+            substeps = []
+
+            for i in range(N):
+                t_a = (raw_t - stu_iv[:, i]).clamp(min=0)
+                t_a = torch.minimum(t_a, raw_t)
+
+                # Student rollout → z_anchor, free logits immediately
+                lgs = student.heads.compute_one_head(
+                    hidden_src=hidden_src, z=z, c=c_src,
+                    t_cur=raw_t, band_idx=band_idx)
+                lps = F.log_softmax(lgs.float(), dim=-1)
+                del lgs
+                z_anchor = absorbing_reverse_step(
+                    z, lps, raw_t, t_a, MASK_ID)
+                del lps
+
+                # Teacher at anchor
+                lpT = teacher.forward_log_probs(z_anchor, t_a)
+
+                # Student at anchor
+                lgS = student.heads.compute_one_head(
+                    hidden_src=hidden_src, z=z_anchor, c=c_src,
+                    t_cur=t_a, band_idx=band_idx)
+                lpS = F.log_softmax(lgS.float(), dim=-1)
+                del lgS
+
+                mask = (z_anchor == MASK_ID)
+                mr = mask.float().mean().item()
+
+                # Metrics that need both lpT and lpS
+                kl = KL_loss(lpT, lpS, mask, chunk_size=512).item()
+                ag = _agree(lpT, lpS, mask)
+
+                # Student-only metrics, then free lpS
+                eS = _entropy_chunked(lpS, mask)
+                aS = _acc(lpS, x0, mask)
+                del lpS
+
+                # Teacher-only metrics (lpT still needed for rollout)
+                eT = _entropy_chunked(lpT, mask)
+                aT = _acc(lpT, x0, mask)
+
+                substeps.append(dict(
+                    i=i, kl=kl, mask_ratio=mr,
+                    ent_T=eT, ent_S=eS,
+                    acc_T=aT, acc_S=aS,
+                    agree=ag, t_a=t_a.mean().item()))
+
+                # Teacher rollout, then free lpT
+                t_b = (t_a - tea_iv[:, i]).clamp(min=0)
+                t_b = torch.minimum(t_b, t_a)
+                z = absorbing_reverse_step(
+                    z_anchor, lpT, t_a, t_b, MASK_ID)
+                del lpT
+                raw_t = t_b
+
+            del hidden_src, c_src
+
+        ft_err = (raw_t - t_dst).abs().max().item()
+        fm_ratio = (z == MASK_ID).float().mean().item()
+        results.append(dict(
+            band=band_idx, substeps=substeps,
+            final_t_error=ft_err, final_mask_ratio=fm_ratio))
+
+        torch.cuda.empty_cache()
+
+    if was_training:
+        student.train()
+    return results
+
+
+def print_on_policy_diag(results, header=""):
+    if header:
+        print(f"\n  {header}")
+    for r in results:
+        b = r['band']
+        print(f"  band {b}: final_mask={r['final_mask_ratio']:.4f}  "
+              f"t_error={r['final_t_error']:.2e}")
+        print(f"    {'sub':>3} {'KL':>7} {'ent_T':>6} {'ent_S':>6} "
+              f"{'accT':>6} {'accS':>6} {'agree':>6} "
+              f"{'mask':>6} {'t_a':>6}")
+        for s in r['substeps']:
+            print(f"    {s['i']:>3} {s['kl']:>7.3f} "
+                  f"{s['ent_T']:>6.2f} {s['ent_S']:>6.2f} "
+                  f"{s['acc_T']:>6.3f} {s['acc_S']:>6.3f} "
+                  f"{s['agree']:>6.3f} "
+                  f"{s['mask_ratio']:>6.3f} {s['t_a']:>6.3f}")
+
+
 # ── Sanity check (inline, quick) ───────────────────────────────────
 
 def sanity_check_residual(student, config, device):
@@ -298,6 +446,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output_dir", type=str, default="./outputs_stm")
     args = parser.parse_args()
 
     config = Config()
@@ -326,7 +475,7 @@ def main():
     config.save_every = 500
     config.sample_every = 500
     config.num_sample_texts = 4
-    config.output_dir_stm = "./outputs_stm"
+    config.output_dir_stm = args.output_dir
 
     max_steps = args.max_steps
     device = config.device
@@ -385,6 +534,7 @@ def main():
 
     print(f"\nStarting STM training ({max_steps} steps)...\n")
 
+    abort = False
     for step in range(1, max_steps + 1):
         try:
             batch = next(train_iter)
@@ -397,14 +547,38 @@ def main():
         tau = get_tau(step, config.tau_min, config.tau_warmup_frac,
                       config.tau_decay_frac, config.tau_total_steps)
 
-        metrics = train_step_stm(
-            student, teacher, x0, config, optimizer, scheduler, step, tau)
+        # ── Train step with OOM guard ──
+        try:
+            metrics = train_step_stm(
+                student, teacher, x0, config, optimizer, scheduler,
+                step, tau)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"FATAL: OOM at step {step}. Aborting.")
+                torch.cuda.empty_cache()
+                abort = True
+                break
+            raise
 
         losses.append(metrics['loss'])
         step_metrics.append(metrics)
 
+        # ── Auto-stop: NaN / Inf ──
         if metrics['loss'] != metrics['loss']:
-            print(f"FATAL: NaN at step {step}")
+            print(f"FATAL: NaN loss at step {step}. Aborting.")
+            abort = True
+            break
+        if abs(metrics['loss']) > 1e10:
+            print(f"FATAL: Inf-like loss={metrics['loss']:.2e} "
+                  f"at step {step}. Aborting.")
+            abort = True
+            break
+
+        # ── Auto-stop: final_t_error ──
+        if metrics['final_t_error'] > 1e-3:
+            print(f"FATAL: final_t_error={metrics['final_t_error']:.4e} "
+                  f"> 1e-3 at step {step}. Aborting.")
+            abort = True
             break
 
         # ── Regular log (every 50 steps) ──
@@ -428,8 +602,18 @@ def main():
         if step % DIAG_EVERY == 0:
             batch_diag = next(iter(train_loader))
             x0_diag = batch_diag['input_ids'].to(device)
+
+            # STATIC DIAG
             diags = diag_all_bands(student, teacher, x0_diag, config)
-            print_diag_table(diags, f"Diagnostics @ step {step}")
+            print_diag_table(diags,
+                             f"STATIC DIAG @ step {step}")
+
+            # ON-POLICY STM DIAG
+            op_diag = on_policy_stm_diag(
+                student, teacher, x0_diag, config, tau)
+            print_on_policy_diag(op_diag,
+                                 f"ON-POLICY STM DIAG @ step {step} "
+                                 f"(tau={tau:.3f})")
 
             # STM-specific averages over last DIAG_EVERY steps
             recent = step_metrics[-DIAG_EVERY:]
@@ -439,11 +623,16 @@ def main():
                            for m in recent) / len(recent)
             avg_tea_i = sum(m['mean_teacher_interval']
                            for m in recent) / len(recent)
-            print(f"  delta_scale: {student.heads.delta_scale.data.tolist()}")
+            avg_ft_err = sum(m['final_t_error']
+                            for m in recent) / len(recent)
+            print(f"\n  delta_scale: "
+                  f"{student.heads.delta_scale.data.tolist()}")
+            print(f"  tau: {tau:.4f}")
             print(f"  mean student_total: {avg_stu_t:.4f}")
             print(f"  mean teacher_total: {avg_tea_t:.4f}")
             print(f"  mean student interval: {avg_stu_i:.4f}")
             print(f"  mean teacher interval: {avg_tea_i:.4f}")
+            print(f"  mean final_t_error: {avg_ft_err:.2e}")
 
             student.train()
 
@@ -451,17 +640,25 @@ def main():
         if step % config.save_every == 0:
             path = os.path.join(config.output_dir_stm,
                                 f"ckpt_step{step}.pt")
-            torch.save({
-                'step': step,
-                'student_state_dict': {
-                    'backbone_loras': student.backbone_loras.state_dict(),
-                    'heads': student.heads.trainable_state_dict(),
-                },
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'config': config,
-            }, path)
-            print(f"  Saved: {path}")
+            try:
+                torch.save({
+                    'step': step,
+                    'student_state_dict': {
+                        'backbone_loras':
+                            student.backbone_loras.state_dict(),
+                        'heads':
+                            student.heads.trainable_state_dict(),
+                    },
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'config': config,
+                }, path)
+                print(f"  Saved: {path}")
+            except Exception as e:
+                print(f"FATAL: checkpoint save failed at step {step}: "
+                      f"{e}. Aborting.")
+                abort = True
+                break
 
         # ── Samples ──
         if step % config.sample_every == 0:
@@ -479,6 +676,9 @@ def main():
                       f"{text[:SAMPLE_CHARS]}")
             student.train()
             print()
+
+        if abort:
+            break
 
     # ── Final summary ──
     total_time = time.time() - t0
