@@ -420,6 +420,8 @@ class DHeadStudent(nn.Module):
         return self
 
     def _inject_backbone_lora(self, rank: int):
+        if rank <= 0:
+            return  # No LoRA — backbone stays identical to teacher
         for i, blk in enumerate(self.dit.blocks):
             self.backbone_loras[f'b{i}_qkv'] = LoRALayer(
                 blk.attn_qkv.in_features, blk.attn_qkv.out_features, rank)
@@ -455,6 +457,8 @@ class DHeadStudent(nn.Module):
         c = F.silu(dit.sigma_map(sigma))
         rotary_cos_sin = dit.rotary_emb(x)
 
+        has_lora = len(self.backbone_loras) > 0
+
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
             for i, blk in enumerate(dit.blocks):
                 B, S = x.shape[0], x.shape[1]
@@ -469,7 +473,9 @@ class DHeadStudent(nn.Module):
                 # --- Attention ---
                 x_skip = x
                 x_norm = modulate_fused(blk.norm1(x), shift_msa, scale_msa)
-                qkv = blk.attn_qkv(x_norm) + self.backbone_loras[f'b{i}_qkv'](x_norm)
+                qkv = blk.attn_qkv(x_norm)
+                if has_lora:
+                    qkv = qkv + self.backbone_loras[f'b{i}_qkv'](x_norm)
                 qkv = rearrange(qkv, 'b s (three h d) -> b s three h d',
                                 three=3, h=blk.n_heads)
                 with torch.cuda.amp.autocast(enabled=False):
@@ -482,14 +488,20 @@ class DHeadStudent(nn.Module):
                 attn = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(
                     qkv, cu, S, 0., causal=False)
                 attn = rearrange(attn, '(b s) h d -> b s (h d)', b=B)
-                proj = blk.attn_out(attn) + self.backbone_loras[f'b{i}_out'](attn)
+                proj = blk.attn_out(attn)
+                if has_lora:
+                    proj = proj + self.backbone_loras[f'b{i}_out'](attn)
                 x = bds(proj, None, gate_msa, x_skip, blk.dropout)
 
                 # --- MLP ---
                 mlp_in = modulate_fused(blk.norm2(x), shift_mlp, scale_mlp)
-                up = blk.mlp[0](mlp_in) + self.backbone_loras[f'b{i}_up'](mlp_in)
+                up = blk.mlp[0](mlp_in)
+                if has_lora:
+                    up = up + self.backbone_loras[f'b{i}_up'](mlp_in)
                 mid = blk.mlp[1](up)       # GELU
-                down = blk.mlp[2](mid) + self.backbone_loras[f'b{i}_down'](mid)
+                down = blk.mlp[2](mid)
+                if has_lora:
+                    down = down + self.backbone_loras[f'b{i}_down'](mid)
                 x = bds(down, None, gate_mlp, x, blk.dropout)
 
         return x, c

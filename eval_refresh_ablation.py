@@ -1,7 +1,6 @@
-"""Evaluate student using official MDLM Gen-PPL protocol.
+"""Ablation: stale backbone (1x per band) vs refresh backbone (every substep).
 
-Uses official Diffusion.compute_generative_perplexity() for apples-to-apples
-comparison with teacher baseline.
+If refresh >> stale in Gen-PPL, stale hidden is confirmed as main bottleneck.
 """
 
 import sys
@@ -16,12 +15,11 @@ import numpy as np
 import torch
 import omegaconf
 import transformers
-
 import diffusion as mdlm_diffusion
 
 from config import Config
 from model import build_student
-from inference import generate_samples
+from inference import generate_samples_official, generate_samples_refresh
 
 
 def parse_args():
@@ -31,27 +29,23 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--output_dir", type=str, default="./eval_results")
-    p.add_argument("--backbone_lora_rank", type=int, default=128)
     return p.parse_args()
 
 
 def load_student(ckpt_path, config, device):
     student = build_student(config, device)
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    if len(student.backbone_loras) > 0:
-        student.backbone_loras.load_state_dict(
-            ckpt['student_state_dict']['backbone_loras'])
+    student.backbone_loras.load_state_dict(
+        ckpt['student_state_dict']['backbone_loras'])
     student.heads.load_trainable_state_dict(
         ckpt['student_state_dict']['heads'])
     student.eval()
     step = ckpt.get('step', 'unknown')
-    print(f"Loaded student from {ckpt_path} (step {step})")
+    print(f"Loaded step {step}")
     return student, step
 
 
-def build_gen_ppl_evaluator(device):
-    """Build a minimal Diffusion object just for compute_generative_perplexity."""
+def build_evaluator(device):
     cfg = omegaconf.OmegaConf.create({
         "backbone": "hf_dit",
         "model": {"name": "kuleshov-group/mdlm-owt", "length": 1024},
@@ -78,83 +72,83 @@ def build_gen_ppl_evaluator(device):
     evaluator = mdlm_diffusion.Diffusion(cfg, tokenizer=tokenizer)
     evaluator = evaluator.to(device).eval()
     evaluator.ema = None
-    return evaluator
+    return evaluator, tokenizer
 
 
-@torch.no_grad()
-def generate_all_samples(student, config, num_samples, batch_size, device):
+def gen_batched(student, config, num_samples, batch_size, device, gen_fn):
     all_samples = []
     remaining = num_samples
     generated = 0
     while remaining > 0:
         bs = min(batch_size, remaining)
-        samples = generate_samples(student, config, num_samples=bs,
-                                   device=device)
+        samples = gen_fn(student, config, num_samples=bs, device=device)
         all_samples.append(samples.cpu())
         generated += bs
         remaining -= bs
         if generated % 64 == 0 or remaining == 0:
-            print(f"  Generated {generated}/{num_samples}")
+            print(f"    {generated}/{num_samples}")
     return torch.cat(all_samples, dim=0)
+
+
+def eval_ppl(samples, evaluator, tokenizer):
+    texts = tokenizer.batch_decode(samples.tolist())
+    evaluator.gen_ppl_metric.reset()
+    evaluator.compute_generative_perplexity(texts)
+    return evaluator.gen_ppl_metric.compute().item()
 
 
 def main():
     args = parse_args()
-    torch.manual_seed(args.seed)
-    os.makedirs(args.output_dir, exist_ok=True)
-
     config = Config()
     config.device = args.device
-    config.backbone_lora_rank = args.backbone_lora_rank
 
-    # Load student
     student, step = load_student(args.ckpt, config, args.device)
+    evaluator, tokenizer = build_evaluator(args.device)
 
-    # Generate samples
-    print(f"\nGenerating {args.num_samples} samples...")
-    t0 = time.time()
-    samples = generate_all_samples(
-        student, config, args.num_samples, args.batch_size, args.device)
-    gen_time = time.time() - t0
-    print(f"Generation done in {gen_time:.1f}s")
-
-    # Safety checks
-    n_mask = (samples == config.mask_token_id).sum().item()
-    print(f"Remaining MASK: {n_mask}/{samples.numel()}")
-    assert n_mask == 0, f"Residual MASK tokens: {n_mask}"
-
-    # Free student
-    del student
-    torch.cuda.empty_cache()
-
-    # Decode to text
-    tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
-    text_samples = tokenizer.batch_decode(samples.tolist())
-
-    # Show samples
-    for i in range(min(5, len(text_samples))):
-        print(f"  Sample {i}: {text_samples[i][:200]}")
-
-    # Official Gen-PPL
-    print(f"\nComputing official Gen-PPL...")
-    evaluator = build_gen_ppl_evaluator(args.device)
-    evaluator.gen_ppl_metric.reset()
-    evaluator.compute_generative_perplexity(text_samples)
-    gen_ppl = evaluator.gen_ppl_metric.compute().item()
-
+    # ── Path A: stale backbone (1x per band) ──
     print(f"\n{'='*60}")
-    print(f"  STUDENT EVALUATION — step {step}")
+    print(f"  A: STALE backbone (1x per band, NFE=16)")
     print(f"{'='*60}")
-    print(f"  Checkpoint:      {args.ckpt}")
-    print(f"  Num samples:     {args.num_samples}")
-    print(f"  Gen time:        {gen_time:.1f}s")
-    print(f"  Official Gen-PPL: {gen_ppl:.2f}")
-    print(f"{'='*60}")
+    torch.manual_seed(args.seed)
+    t0 = time.time()
+    samples_stale = gen_batched(student, config, args.num_samples,
+                                args.batch_size, args.device,
+                                generate_samples_official)
+    time_stale = time.time() - t0
+    ppl_stale = eval_ppl(samples_stale, evaluator, tokenizer)
+    for i in range(3):
+        print(f"  Sample {i}: {tokenizer.decode(samples_stale[i].tolist())[:200]}")
+    print(f"  Gen-PPL: {ppl_stale:.2f}  ({time_stale:.1f}s)")
 
-    # Save
-    np.savez(os.path.join(args.output_dir, f"student_official_step{step}.npz"),
-             samples=samples.numpy(),
-             gen_ppl=gen_ppl, gen_time=gen_time, step=step)
+    # ── Path B: refresh backbone (every substep, NFE=32) ──
+    print(f"\n{'='*60}")
+    print(f"  B: REFRESH backbone (every substep, NFE=32)")
+    print(f"{'='*60}")
+    torch.manual_seed(args.seed)
+    t0 = time.time()
+    samples_refresh = gen_batched(student, config, args.num_samples,
+                                  args.batch_size, args.device,
+                                  generate_samples_refresh)
+    time_refresh = time.time() - t0
+    ppl_refresh = eval_ppl(samples_refresh, evaluator, tokenizer)
+    for i in range(3):
+        print(f"  Sample {i}: {tokenizer.decode(samples_refresh[i].tolist())[:200]}")
+    print(f"  Gen-PPL: {ppl_refresh:.2f}  ({time_refresh:.1f}s)")
+
+    # ── Summary ──
+    print(f"\n{'='*60}")
+    print(f"  STALE vs REFRESH — step {step}")
+    print(f"{'='*60}")
+    print(f"  Stale (1x/band):    Gen-PPL = {ppl_stale:.2f}")
+    print(f"  Refresh (every sub): Gen-PPL = {ppl_refresh:.2f}")
+    ratio = ppl_stale / max(ppl_refresh, 1)
+    print(f"  Ratio: {ratio:.2f}x")
+    if ppl_refresh < ppl_stale * 0.5:
+        print(f"  → Stale hidden is the PRIMARY bottleneck.")
+    elif ppl_refresh < ppl_stale * 0.8:
+        print(f"  → Stale hidden matters, but not the only issue.")
+    else:
+        print(f"  → Stale hidden is NOT the main issue.")
 
 
 if __name__ == "__main__":

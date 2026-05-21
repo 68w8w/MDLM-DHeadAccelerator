@@ -549,6 +549,8 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./outputs_stm")
     parser.add_argument("--resume_from", type=str, default=None,
                         help="Path to checkpoint to resume/fine-tune from")
+    parser.add_argument("--backbone_lora_rank", type=int, default=128,
+                        help="LoRA rank for backbone (0 = no LoRA, D-Head only)")
     args = parser.parse_args()
 
     config = Config()
@@ -570,7 +572,7 @@ def main():
     config.beta2 = 0.95
     config.weight_decay = 0.0
     config.grad_clip = 1.0
-    config.backbone_lora_rank = 128
+    config.backbone_lora_rank = args.backbone_lora_rank
     config.kl_chunk_size = 512
     config.dropout = 0.0
     config.log_every = 50
@@ -631,7 +633,11 @@ def main():
     # ── Parameter count ──
     trainable_params = student.get_trainable_parameters()
     n_trainable = sum(p.numel() for p in trainable_params)
-    print(f"\n  Total trainable: {n_trainable:,}")
+    n_lora = sum(p.numel() for p in student.backbone_loras.parameters())
+    n_dhead = n_trainable - n_lora
+    print(f"\n  backbone_lora_rank: {config.backbone_lora_rank}")
+    print(f"  Total trainable: {n_trainable:,} "
+          f"(LoRA: {n_lora:,}, D-Head: {n_dhead:,})")
 
     # ── Data & optimizer ──
     print("\nLoading data...")

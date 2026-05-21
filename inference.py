@@ -220,3 +220,90 @@ def generate_samples_official(
         print(f"noise_removal: cleared {is_mask.sum().item()} masks")
 
     return z
+
+
+# ── Upper bound: refresh backbone every substep ──────────────────────
+
+@torch.no_grad()
+def generate_samples_refresh(
+    student,
+    config: Config,
+    num_samples: int = 4,
+    device: str = None,
+    substeps_per_band: int = None,
+) -> torch.Tensor:
+    """Same as official-compatible but refreshes backbone EVERY substep.
+
+    This is the upper bound — if this produces much better Gen-PPL,
+    stale hidden_src is confirmed as the main bottleneck.
+    NFE = n_bands * K * 2 (backbone + D-Head per step).
+    """
+    if device is None:
+        device = config.device
+
+    L = config.max_length
+    K = substeps_per_band if substeps_per_band is not None else config.K
+    MASK_ID = config.mask_token_id
+    n_bands = config.n_bands
+    eps = 1e-3
+
+    z = torch.full((num_samples, L), MASK_ID, device=device, dtype=torch.long)
+
+    for band_idx in range(n_bands):
+        t_band_high = 1.0 - band_idx / n_bands
+        t_band_low = 1.0 - (band_idx + 1) / n_bands
+
+        band_timesteps = torch.linspace(t_band_high, t_band_low, K + 1,
+                                        device=device)
+
+        for k in range(K):
+            t_cur = band_timesteps[k]
+            t_next = band_timesteps[k + 1]
+            t_cur_batch = torch.full((num_samples,), t_cur.item(),
+                                     device=device)
+
+            # REFRESH backbone every substep
+            hidden_src, c_src = student.forward_backbone(z, t_cur_batch)
+
+            logits = student.heads.compute_one_head(
+                hidden_src=hidden_src, z=z, c=c_src,
+                t_cur=t_cur_batch, band_idx=band_idx)
+
+            logits = logits.float()
+            logits[:, :, MASK_ID] = -1e9
+            logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+
+            unmasked = (z != MASK_ID)
+            logits[unmasked] = -1e9
+            logits[unmasked, z[unmasked]] = 0.0
+
+            p_x0 = logits.exp()
+
+            mc_t = _move_chance(t_cur, eps)
+            mc_s = _move_chance(t_next, eps)
+
+            q_xs = p_x0 * (mc_t - mc_s)
+            q_xs[:, :, MASK_ID] = mc_s
+
+            _x = _mdlm_sample_categorical(q_xs)
+
+            copy_flag = (z != MASK_ID).to(z.dtype)
+            z = (copy_flag * z + (1 - copy_flag) * _x).long()
+
+        remaining_mask_ratio = (z == MASK_ID).float().mean().item()
+        print(f"after band {band_idx}, remaining_mask_ratio="
+              f"{remaining_mask_ratio:.6f}")
+
+    # noise_removal
+    is_mask = (z == MASK_ID)
+    if is_mask.any():
+        t_eps = torch.full((num_samples,), eps, device=device)
+        hidden_final, c_final = student.forward_backbone(z, t_eps)
+        logits_final = student.heads.compute_one_head(
+            hidden_src=hidden_final, z=z, c=c_final,
+            t_cur=t_eps, band_idx=n_bands - 1)
+        pred = logits_final.argmax(dim=-1)
+        z = torch.where(is_mask, pred, z)
+        print(f"noise_removal: cleared {is_mask.sum().item()} masks")
+
+    return z
